@@ -1,7 +1,7 @@
 {
-  "name": "3D Perception Sensor",
+  "name": "3D Ground Truth Sensor",
   "accessType": "public",
-  "description": "Example of a 3D perception sensor.",
+  "description": "This sensor returns 3D ground truth data for training and creates bounding boxes around the detected objects. The color of the object corresponds to the object's type:\n\t[\n\t\t\"Car\": \"Green\"\n\t\t\"Pedestrian\": \"Yellow\"\n\t\t\"Bicycle\": \"Cyan\"\n\t\t\"Unknown\":  \"Magenta\"\n\t]\nSee {{DOCS_HOST}}/docs/python-api/#3d-ground-truth for more details.",
   "licenseName": "LG Content",
   "copyright": "LG Electronics Inc.",
   "tags": [
