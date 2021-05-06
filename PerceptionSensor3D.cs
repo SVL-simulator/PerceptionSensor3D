@@ -95,9 +95,9 @@ namespace Simulator.Sensors
             float angular_speed;  // Angular speed around up axis of objects, in radians/sec
             if (parent.layer == LayerMask.NameToLayer("Agent"))
             {
-                var egoC = parent.GetComponent<VehicleController>();
+                var controller = parent.GetComponent<IAgentController>();
                 var rb = parent.GetComponent<Rigidbody>();
-                id = egoC.GTID;
+                id = controller.GTID;
                 label = "Sedan";
                 velocity = rb.velocity;
                 angular_speed = rb.angularVelocity.y;
