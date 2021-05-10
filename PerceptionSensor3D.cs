@@ -40,7 +40,8 @@ namespace Simulator.Sensors
         [AnalysisMeasurement(MeasurementType.Count)]
         public int MaxTracked = -1;
 
-        public override SensorDistributionType DistributionType => SensorDistributionType.HighLoad;
+        public override SensorDistributionType DistributionType => SensorDistributionType.MainOrClient;
+        public override float PerformanceLoad { get; } = 0.2f;
         MapOrigin MapOrigin;
 
         public override void OnBridgeSetup(BridgeInstance bridge)
@@ -49,7 +50,7 @@ namespace Simulator.Sensors
             Publish = Bridge.AddPublisher<Detected3DObjectData>(Topic);
         }
 
-        void Start()
+        protected override void Initialize()
         {
             WireframeBoxes = SimulatorManager.Instance.WireframeBoxes;
 
@@ -67,6 +68,14 @@ namespace Simulator.Sensors
             CurrentIDs = new HashSet<uint>();
 
             StartCoroutine(OnPublish());
+        }
+
+        protected override void Deinitialize()
+        {
+            StopAllCoroutines();
+
+            Detected.Clear();
+            CurrentIDs.Clear();
         }
 
         private void FixedUpdate()
@@ -263,14 +272,6 @@ namespace Simulator.Sensors
             return Vector3.Distance(transform.position, bounds.center) < 50f;
             //var activeCameraPlanes = Utility.CalculateFrustum(transform.position, (bounds.center - transform.position).normalized);
             //return GeometryUtility.TestPlanesAABB(activeCameraPlanes, bounds);
-        }
-
-        void OnDestroy()
-        {
-            StopAllCoroutines();
-
-            Detected.Clear();
-            CurrentIDs.Clear();
         }
     }
 }
