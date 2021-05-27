@@ -44,6 +44,8 @@ namespace Simulator.Sensors
         public override float PerformanceLoad { get; } = 0.2f;
         MapOrigin MapOrigin;
 
+        private IAgentController Controller;
+        private IVehicleDynamics Dynamics;
         public override void OnBridgeSetup(BridgeInstance bridge)
         {
             Bridge = bridge;
@@ -52,6 +54,8 @@ namespace Simulator.Sensors
 
         protected override void Initialize()
         {
+            Controller = GetComponentInParent<IAgentController>();
+            Dynamics = GetComponentInParent<IVehicleDynamics>();
             WireframeBoxes = SimulatorManager.Instance.WireframeBoxes;
 
             if (RangeTrigger == null)
@@ -104,12 +108,10 @@ namespace Simulator.Sensors
             float angular_speed;  // Angular speed around up axis of objects, in radians/sec
             if (parent.layer == LayerMask.NameToLayer("Agent"))
             {
-                var controller = parent.GetComponent<IAgentController>();
-                var rb = parent.GetComponent<Rigidbody>();
-                id = controller.GTID;
+                id = Controller.GTID;
                 label = "Sedan";
-                velocity = rb.velocity;
-                angular_speed = rb.angularVelocity.y;
+                velocity = Dynamics.Velocity;
+                angular_speed = Dynamics.AngularVelocity.y;
             }
             else if (parent.layer == LayerMask.NameToLayer("NPC"))
             {
