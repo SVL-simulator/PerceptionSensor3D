@@ -29,7 +29,7 @@ namespace Simulator.Sensors
         public float MaxDistance = 100.0f;
 
         public RangeTrigger RangeTrigger;
-        WireframeBoxes WireframeBoxes;
+        private WireframeBoxes WireframeBoxes;
 
         private BridgeInstance Bridge;
         private Publisher<Detected3DObjectData> Publish;
@@ -42,7 +42,7 @@ namespace Simulator.Sensors
 
         public override SensorDistributionType DistributionType => SensorDistributionType.MainOrClient;
         public override float PerformanceLoad { get; } = 0.2f;
-        MapOrigin MapOrigin;
+        private MapOrigin MapOrigin;
 
         private IAgentController Controller;
         private IVehicleDynamics Dynamics;
@@ -152,7 +152,7 @@ namespace Simulator.Sensors
             var heading = parent.transform.localEulerAngles.y - mapRotation.eulerAngles.y;
 
             // Center of bounding box
-            GpsLocation location = MapOrigin.GetGpsLocation(((BoxCollider)other).bounds.center);
+            GpsLocation location = MapOrigin.PositionToGpsLocation(((BoxCollider)other).bounds.center);
             GpsData gps = new GpsData()
             {
                 Easting = location.Easting,
@@ -271,9 +271,7 @@ namespace Simulator.Sensors
 
         public bool CheckVisible(Bounds bounds)
         {
-            return Vector3.Distance(transform.position, bounds.center) < 50f;
-            //var activeCameraPlanes = Utility.CalculateFrustum(transform.position, (bounds.center - transform.position).normalized);
-            //return GeometryUtility.TestPlanesAABB(activeCameraPlanes, bounds);
+            return Vector3.Distance(transform.position, bounds.center) < 50f; // TODO GT updates
         }
     }
 }
