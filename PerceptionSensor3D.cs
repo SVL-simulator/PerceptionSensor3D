@@ -6,7 +6,6 @@
  */
 
 using System;
-using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
 using Simulator.Bridge;
@@ -17,35 +16,72 @@ using Simulator.Sensors.UI;
 
 namespace Simulator.Sensors
 {
+    using Components;
+    using UnityEngine.Experimental.Rendering;
+    using UnityEngine.Rendering;
+    using UnityEngine.Rendering.HighDefinition;
+
     [SensorType("3D Ground Truth", new[] { typeof(Detected3DObjectData) })]
-    public class PerceptionSensor3D : SensorBase
+    public class PerceptionSensor3D : FrequencySensorBase
     {
-        [SensorParameter]
-        [Range(1f, 100f)]
-        public float Frequency = 10.0f;
+        private static class Properties
+        {
+            public static readonly int TexSize = Shader.PropertyToID("_TexSize");
+            public static readonly int Input = Shader.PropertyToID("_Input");
+            public static readonly int MaskBuffer = Shader.PropertyToID("_MaskBuffer");
+        }
+
+        private class DetectedObject
+        {
+            public Detected3DObject object3d;
+            public Transform transform;
+            public Bounds bounds;
+        }
 
         [SensorParameter]
         [Range(1f, 1000f)]
         public float MaxDistance = 100.0f;
 
-        public RangeTrigger RangeTrigger;
         private WireframeBoxes WireframeBoxes;
 
         private BridgeInstance Bridge;
         private Publisher<Detected3DObjectData> Publish;
 
-        private Dictionary<uint, Tuple<Detected3DObject, Collider>> Detected;
-        private HashSet<uint> CurrentIDs;
+        private List<DetectedObject> DetectedObjects = new List<DetectedObject>();
 
         [AnalysisMeasurement(MeasurementType.Count)]
         public int MaxTracked = -1;
+
+        public ComputeShader cs;
 
         public override SensorDistributionType DistributionType => SensorDistributionType.MainOrClient;
         public override float PerformanceLoad { get; } = 0.2f;
         private MapOrigin MapOrigin;
 
         private IAgentController Controller;
-        private IVehicleDynamics Dynamics;
+
+        private ShaderTagId passId;
+        private Camera sensorCamera;
+        private ComputeBuffer maskBuffer;
+        private uint[] maskBufferArr = new uint[256];
+        private const int CubemapSize = 1024;
+        private RTHandle rtColor;
+        private RTHandle rtDepth;
+        private uint seqId;
+
+        private Camera SensorCamera
+        {
+            get
+            {
+                if (sensorCamera == null)
+                    sensorCamera = GetComponent<Camera>();
+
+                return sensorCamera;
+            }
+        }
+        
+        protected override bool UseFixedUpdate => false;
+        
         public override void OnBridgeSetup(BridgeInstance bridge)
         {
             Bridge = bridge;
@@ -55,90 +91,206 @@ namespace Simulator.Sensors
         protected override void Initialize()
         {
             Controller = GetComponentInParent<IAgentController>();
-            Dynamics = GetComponentInParent<IVehicleDynamics>();
-            WireframeBoxes = SimulatorManager.Instance.WireframeBoxes;
-
-            if (RangeTrigger == null)
-            {
-                RangeTrigger = GetComponentInChildren<RangeTrigger>();
-            }
-
-            RangeTrigger.SetCallbacks(WhileInRange);
-            RangeTrigger.transform.localScale = MaxDistance * Vector3.one;
 
             MapOrigin = MapOrigin.Find();
 
-            Detected = new Dictionary<uint, Tuple<Detected3DObject, Collider>>();
-            CurrentIDs = new HashSet<uint>();
+            passId = new ShaderTagId("SimulatorSegmentationPass");
+            SensorCamera.farClipPlane = MaxDistance;
+            var hdData = SensorCamera.gameObject.GetComponent<HDAdditionalCameraData>();
+            hdData.customRender += OnSegmentationRender;
+            hdData.hasPersistentHistory = true;
 
-            StartCoroutine(OnPublish());
+            rtColor = RTHandles.Alloc(
+                CubemapSize,
+                CubemapSize,
+                6,
+                DepthBits.None,
+                GraphicsFormat.R8G8B8A8_UNorm,
+                dimension: TextureDimension.Tex2DArray,
+                useDynamicScale: false,
+                name: "Perc3D_Tex2DArr",
+                wrapMode: TextureWrapMode.Clamp);
+
+            rtDepth = RTHandles.Alloc(
+                CubemapSize,
+                CubemapSize,
+                6,
+                DepthBits.Depth32,
+                GraphicsFormat.R32_UInt,
+                dimension: TextureDimension.Tex2DArray,
+                useDynamicScale: false,
+                name: "Perc3D_Tex2DArr",
+                wrapMode: TextureWrapMode.Clamp);
+
+            maskBuffer = new ComputeBuffer(256, sizeof(uint));
+
+            WireframeBoxes = SimulatorManager.Instance.WireframeBoxes;
         }
 
         protected override void Deinitialize()
         {
-            StopAllCoroutines();
-
-            Detected.Clear();
-            CurrentIDs.Clear();
+            DetectedObjects.Clear();
+            
+            rtColor?.Release();
+            rtDepth?.Release();
+            maskBuffer?.Release();
         }
 
-        private void FixedUpdate()
+        private void OnSegmentationRender(ScriptableRenderContext context, HDCamera hdCamera)
         {
-            MaxTracked = Math.Max(MaxTracked, CurrentIDs.Count);
-            CurrentIDs.Clear();
+            var cmd = CommandBufferPool.Get();
+            RenderToTextureArray(context, cmd, hdCamera);
+
+            var clearKernel = cs.FindKernel("Clear");
+            cmd.SetComputeBufferParam(cs, clearKernel, Properties.MaskBuffer, maskBuffer);
+            cmd.DispatchCompute(cs, clearKernel, 4, 1, 1);
+
+            var detectKernel = cs.FindKernel("Detect");
+            cmd.SetComputeTextureParam(cs, detectKernel, Properties.Input, rtColor, 0);
+            cmd.SetComputeVectorParam(cs, Properties.TexSize, new Vector4(CubemapSize, CubemapSize, 1f / CubemapSize, 1f / CubemapSize));
+            cmd.SetComputeBufferParam(cs, detectKernel, Properties.MaskBuffer, maskBuffer);
+            cmd.DispatchCompute(cs, detectKernel, HDRPUtilities.GetGroupSize(CubemapSize, 8), HDRPUtilities.GetGroupSize(CubemapSize, 8), 6);
+
+            context.ExecuteCommandBuffer(cmd);
+            cmd.Clear();
+            CommandBufferPool.Release(cmd);
         }
 
-        void WhileInRange(Collider other)
+        private void RenderToTextureArray(ScriptableRenderContext context, CommandBuffer cmd, HDCamera hd)
         {
-            GameObject egoGO = transform.parent.gameObject;
-            GameObject parent = other.transform.parent.gameObject;
-            if (parent == egoGO)
+            var hdrp = (HDRenderPipeline) RenderPipelineManager.currentPipeline;
+            hdrp.UpdateShaderVariablesForCamera(cmd, hd);
+            context.SetupCameraProperties(hd.camera);
+
+            var originalProj = hd.camera.projectionMatrix;
+
+            var trans = hd.camera.transform;
+            var rot = trans.rotation;
+            var localRot = trans.localRotation;
+
+            cmd.SetInvertCulling(true);
+
+            for (var i = 0; i < 6; ++i)
             {
-                return;
+                trans.localRotation = localRot * Quaternion.LookRotation(CoreUtils.lookAtList[i], CoreUtils.upVectorList[i]);
+                hdrp.SetupGlobalParamsForCubemap(cmd, hd, CubemapSize, out var proj);
+                hd.camera.projectionMatrix = proj;
+
+                CoreUtils.SetRenderTarget(cmd, rtColor, rtDepth, depthSlice: i);
+                cmd.ClearRenderTarget(true, true, SimulatorManager.Instance.SkySegmentationColor);
+
+                context.ExecuteCommandBuffer(cmd);
+                cmd.Clear();
+
+                if (hd.camera.TryGetCullingParameters(out var culling))
+                {
+                    var cull = context.Cull(ref culling);
+
+                    var sorting = new SortingSettings(hd.camera);
+                    var drawing = new DrawingSettings(passId, sorting);
+                    var filter = new FilteringSettings(RenderQueueRange.all);
+
+                    context.DrawRenderers(cull, ref drawing, ref filter);
+                }
             }
 
-            if (!(other.gameObject.layer == LayerMask.NameToLayer("GroundTruth")) || !parent.activeInHierarchy)
+            cmd.SetInvertCulling(false);
+
+            hd.camera.projectionMatrix = originalProj;
+            trans.rotation = rot;
+        }
+
+        protected override void SensorUpdate()
+        {
+            SensorCamera.Render();
+            maskBuffer.GetData(maskBufferArr);
+
+            DetectedObjects.Clear();
+
+            // 0 is reserved for clear color, 255 for non-agent segmentation
+            for (var i = 1; i < 255; ++i)
             {
-                return;
+                if (maskBufferArr[i] == 0)
+                    continue;
+
+                var detected = GetDetectedObject(i);
+                if (detected != null)
+                    DetectedObjects.Add(detected);
+            }
+
+            MaxTracked = Math.Max(MaxTracked, DetectedObjects.Count);
+
+            if (Bridge != null && Bridge.Status == Status.Connected)
+            {
+                var data = new Detected3DObject[DetectedObjects.Count];
+                for (var i = 0; i < data.Length; ++i)
+                    data[i] = DetectedObjects[i].object3d;
+
+                Publish(new Detected3DObjectData()
+                {
+                    Name = Name,
+                    Frame = Frame,
+                    Time = SimulatorManager.Instance.CurrentTime,
+                    Sequence = seqId++,
+                    Data = data,
+                });
+            }
+        }
+
+        private DetectedObject GetDetectedObject(int segId)
+        {
+            if (!SimulatorManager.Instance.SegmentationIdMapping.TryGetEntityGameObject(segId, out var go, out var type))
+            {
+                Debug.LogError($"Entity with ID {segId} is not registered.");
+                return null;
             }
 
             uint id;
             string label;
             Vector3 velocity;
             float angular_speed;  // Angular speed around up axis of objects, in radians/sec
-            if (parent.layer == LayerMask.NameToLayer("Agent"))
+
+            switch (type)
             {
-                id = Controller.GTID;
-                label = "Sedan";
-                velocity = Dynamics.Velocity;
-                angular_speed = Dynamics.AngularVelocity.y;
-            }
-            else if (parent.layer == LayerMask.NameToLayer("NPC"))
-            {
-                var npcC = parent.GetComponent<NPCController>();
-                id = npcC.GTID;
-                label = npcC.NPCLabel;
-                velocity = npcC.GetVelocity();
-                angular_speed = npcC.GetAngularVelocity().y;
-            }
-            else if (parent.layer == LayerMask.NameToLayer("Pedestrian"))
-            {
-                var pedC = parent.GetComponent<PedestrianController>();
-                id = pedC.GTID;
-                label = "Pedestrian";
-                velocity = pedC.CurrentVelocity;
-                angular_speed = pedC.CurrentAngularVelocity.y;
-            }
-            else
-            {
-                return;
+                case SegmentationIdMapping.SegmentationEntityType.Agent:
+                {
+                    var controller = go.GetComponent<IAgentController>();
+                    var dynamics = go.GetComponent<IVehicleDynamics>();
+                    id = controller.GTID;
+                    label = "Sedan";
+                    velocity = dynamics.Velocity;
+                    angular_speed = dynamics.AngularVelocity.y;
+                }
+                    break;
+                case SegmentationIdMapping.SegmentationEntityType.NPC:
+                {
+                    var npcC = go.GetComponent<NPCController>();
+                    id = npcC.GTID;
+                    label = npcC.NPCLabel;
+                    velocity = npcC.GetVelocity();
+                    angular_speed = npcC.GetAngularVelocity().y;
+                }
+                    break;
+                case SegmentationIdMapping.SegmentationEntityType.Pedestrian:
+                {
+                    var pedC = go.GetComponent<PedestrianController>();
+                    id = pedC.GTID;
+                    label = "Pedestrian";
+                    velocity = pedC.CurrentVelocity;
+                    angular_speed = pedC.CurrentAngularVelocity.y;
+                }
+                    break;
+                default:
+                {
+                    Debug.LogError($"Invalid entity type: {type.ToString()}");
+                    return null;
+                }
             }
 
-            Vector3 size = ((BoxCollider)other).size;
-            if (size.magnitude == 0)
-            {
-                return;
-            }
+            if (id == Controller.GTID)
+                return null;
+
+            var parent = go.transform.gameObject;
 
             // Linear speed in forward direction of objects, in meters/sec
             float speed = Vector3.Dot(velocity, parent.transform.forward);
@@ -152,7 +304,7 @@ namespace Simulator.Sensors
             var heading = parent.transform.localEulerAngles.y - mapRotation.eulerAngles.y;
 
             // Center of bounding box
-            GpsLocation location = MapOrigin.PositionToGpsLocation(((BoxCollider)other).bounds.center);
+            GpsLocation location = MapOrigin.PositionToGpsLocation(go.transform.position);
             GpsData gps = new GpsData()
             {
                 Easting = location.Easting,
@@ -160,118 +312,52 @@ namespace Simulator.Sensors
                 Altitude = location.Altitude,
             };
 
-            if (!Detected.ContainsKey(id))
+            if (!SimulatorManager.Instance.SegmentationIdMapping.TryGetEntityLocalBoundingBox(segId, out var bounds))
+                return null;
+
+            var obj = new Detected3DObject()
             {
-                var det = new Detected3DObject()
-                {
-                    Id = id,
-                    Label = label,
-                    Score = 1.0f,
-                    Position = relPos,
-                    Rotation = relRot,
-                    Scale = size,
-                    LinearVelocity = new Vector3(speed, 0, 0),
-                    AngularVelocity = new Vector3(0, 0, angular_speed),
-                    Velocity = velocity,
-                    Gps = gps,
-                    Heading = heading,
-                    TrackingTime = 0f,
-                };
+                Id = id,
+                Label = label,
+                Score = 1.0f,
+                Position = relPos,
+                Rotation = relRot,
+                Scale = bounds.size,
+                LinearVelocity = new Vector3(speed, 0, 0),
+                AngularVelocity = new Vector3(0, 0, angular_speed),
+                Velocity = velocity,
+                Gps = gps,
+                Heading = heading,
+                TrackingTime = 0f,
+            };
 
-                Detected.Add(id, new Tuple<Detected3DObject, Collider>(det, other));
-            }
-            else
+            return new DetectedObject
             {
-                var det = Detected[id].Item1;
-                det.Position = relPos;
-                det.Rotation = relRot;
-                det.LinearVelocity = new Vector3(speed, 0, 0);
-                det.AngularVelocity = new Vector3(0, 0, angular_speed);
-                det.Acceleration = (velocity - det.Velocity) / Time.fixedDeltaTime;
-                det.Velocity = velocity;
-                det.Gps = gps;
-                det.Heading = heading;
-                det.TrackingTime += Time.fixedDeltaTime;
-            }
-
-            CurrentIDs.Add(id);
-        }
-
-        private IEnumerator OnPublish()
-        {
-            uint seqId = 0;
-            double nextSend = SimulatorManager.Instance.CurrentTime + 1.0f / Frequency;
-
-            while (true)
-            {
-                yield return new WaitForFixedUpdate();
-
-                var IDs = new HashSet<uint>(Detected.Keys);
-                IDs.ExceptWith(CurrentIDs);
-                foreach(uint id in IDs)
-                {
-                    Detected.Remove(id);
-                }
-
-                if (Bridge != null && Bridge.Status == Status.Connected)
-                {
-                    if (SimulatorManager.Instance.CurrentTime < nextSend)
-                    {
-                        continue;
-                    }
-                    nextSend = SimulatorManager.Instance.CurrentTime + 1.0f / Frequency;
-
-                    var currentObjects = new List<Detected3DObject>();
-                    foreach (uint id in CurrentIDs)
-                    {
-                        currentObjects.Add(Detected[id].Item1);
-                    }
-
-                    var data = new Detected3DObjectData()
-                    {
-                        Name = Name,
-                        Frame = Frame,
-                        Time = SimulatorManager.Instance.CurrentTime,
-                        Sequence = seqId++,
-                        Data = currentObjects.ToArray(),
-                    };
-
-                    Publish(data);
-                }
-            }
+                object3d = obj,
+                bounds = bounds,
+                transform = parent.transform
+            };
         }
 
         public override void OnVisualize(Visualizer visualizer)
         {
-            foreach (uint id in CurrentIDs)
+            foreach (var item in DetectedObjects)
             {
-                var col = Detected[id].Item2;
-                if (col.gameObject.activeInHierarchy)
-                {
-                    GameObject parent = col.gameObject.transform.parent.gameObject;
-                    Color color = Color.green;
-                    if (parent.layer == LayerMask.NameToLayer("Pedestrian"))
-                    {
-                        color = Color.yellow;
-                    }
+                var obj = item.object3d;
+                var min = obj.Position - obj.Scale / 2;
+                var max = obj.Position + obj.Scale / 2;
 
-                    BoxCollider box = col as BoxCollider;
-                    WireframeBoxes.Draw
-                    (
-                        box.transform.localToWorldMatrix,
-                        new Vector3(0f, box.bounds.extents.y, 0f),
-                        box.size,
-                        color
-                    );
-                }
+                var color = string.Equals(obj.Label, "Pedestrian") ? Color.yellow : Color.green;
+                WireframeBoxes.Draw
+                (
+                    item.transform.localToWorldMatrix,
+                    new Vector3(0f, item.bounds.extents.y, 0f),
+                    item.bounds.size,
+                    color
+                );
             }
         }
 
         public override void OnVisualizeToggle(bool state) {}
-
-        public bool CheckVisible(Bounds bounds)
-        {
-            return Vector3.Distance(transform.position, bounds.center) < 50f; // TODO GT updates
-        }
     }
 }
