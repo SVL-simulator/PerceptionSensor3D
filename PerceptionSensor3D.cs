@@ -293,7 +293,10 @@ namespace Simulator.Sensors
             var parent = go.transform.gameObject;
 
             // Linear speed in forward direction of objects, in meters/sec
-            float speed = Vector3.Dot(velocity, parent.transform.forward);
+            float speedX = Vector3.Dot(velocity, parent.transform.forward);
+            float speedY = Vector3.Dot(velocity, -parent.transform.right);
+            float speedZ = Vector3.Dot(velocity, parent.transform.up);
+
             // Local position of object in ego local space
             Vector3 relPos = transform.InverseTransformPoint(parent.transform.position);
             // Relative rotation of objects wrt ego frame
@@ -323,7 +326,7 @@ namespace Simulator.Sensors
                 Position = relPos,
                 Rotation = relRot,
                 Scale = bounds.size,
-                LinearVelocity = new Vector3(speed, 0, 0),
+                LinearVelocity = new Vector3(speedX, speedY, speedZ),
                 AngularVelocity = new Vector3(0, 0, angular_speed),
                 Velocity = velocity,
                 Gps = gps,
